@@ -17,20 +17,24 @@ SSH_KEY ?= $(HOME)/.ssh/id_ed25519
 KUBECONFIG_FILE := $(CURDIR)/.kube/config
 export KUBECONFIG := $(KUBECONFIG_FILE)
 
-.PHONY: help up destroy vm-up vm-destroy vm-ip ssh status
+.PHONY: help up destroy vm-up vm-destroy vm-stop vm-ip ssh status
 
 help: ## Affiche cette aide
 	@grep -E '^[a-zA-Z0-9_-]+:.*?## ' $(MAKEFILE_LIST) \
 		| awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}'
 
-up: vm-up ## Crée l'environnement (Session 1 : une VM jetable)
+up: vm-up ## Crée ou démarre la VM (convergent)
 
-destroy: vm-destroy ## Détruit l'environnement
+destroy: vm-destroy ## Détruit tout : VM, disque, seed (garde l'image de base)
 
-vm-up: ## Crée la VM Ubuntu 24.04 (idempotent)
+vm-up: ## Crée / démarre la VM Ubuntu 24.04 et attend SSH
 	./scripts/vm-up.sh
 
-vm-destroy: ## Détruit la VM et son disque (conserve l'image de base)
+vm-stop: ## Arrêt propre de la VM (ACPI)
+	@virsh shutdown $(VM_NAME) 2>/dev/null \
+		&& echo "arrêt demandé (compter ~10 s)" || echo "VM déjà éteinte"
+
+vm-destroy: ## Détruit la VM, son disque et son seed
 	./scripts/vm-destroy.sh
 
 vm-ip: ## Affiche l'adresse IP de la VM

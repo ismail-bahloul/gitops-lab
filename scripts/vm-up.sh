@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
 #
-# Crée une VM Ubuntu 24.04 jetable sur libvirt (réseau NAT « default »).
+# Crée OU démarre la VM Ubuntu 24.04 jetable sur libvirt (réseau NAT « default »).
 #
 # Ce script est le PROTOTYPE MANUEL de ce que Terraform automatisera en
 # Session 2. Il existe pour deux raisons :
 #   1. garder l'hôte propre : tout ce qui touche au cluster vit dans la VM ;
 #   2. comprendre chaque paramètre avant de le traduire en HCL.
 #
-# Idempotent : si la VM existe déjà, le script ne fait rien.
+# Convergent : `make up` crée la VM si elle n'existe pas, la démarre si elle
+# est éteinte, et ne fait rien si elle tourne déjà. Dans les trois cas, il
+# termine en affichant une VM joignable en SSH.
 
 set -euo pipefail
 
@@ -39,6 +41,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CLOUD_INIT_DIR="${REPO_ROOT}/cloud-init"
 BUILD_DIR="${REPO_ROOT}/build"
 SEED_DIR="${BUILD_DIR}/seed"
+KNOWN_HOSTS="${BUILD_DIR}/known_hosts"
 
 QEMU_USER="${QEMU_USER:-qemu}"
 
@@ -47,20 +50,9 @@ warn() { printf '\033[1;33m==>\033[0m %s\n' "$*"; }
 die()  { printf '\033[1;31merreur:\033[0m %s\n' "$*" >&2; exit 1; }
 
 # --- prérequis -------------------------------------------------------------
-for bin in virt-install virsh qemu-img curl sha256sum xorriso; do
-    command -v "${bin}" >/dev/null 2>&1 || die "${bin} introuvable"
-done
 [[ -r "${SSH_PUBKEY_FILE}" ]] || die "clé publique SSH introuvable : ${SSH_PUBKEY_FILE}"
 id -u "${QEMU_USER}" >/dev/null 2>&1 || QEMU_USER="root"
 
-if virsh dominfo "${VM_NAME}" >/dev/null 2>&1; then
-    log "la VM ${VM_NAME} existe déjà — rien à faire"
-    exit 0
-fi
-
-# --- libvirt : service et réseau NAT --------------------------------------
-# Le réseau « default » (192.168.122.0/24) fait du NAT : la VM sort vers
-# Internet (images K3s, Argo CD, ghcr.io) et l'hôte peut la joindre.
 log "vérification de libvirtd et du réseau NAT"
 systemctl is-active --quiet libvirtd || sudo systemctl enable --now libvirtd
 virsh net-info default >/dev/null 2>&1 || die "réseau libvirt « default » absent"
@@ -74,86 +66,100 @@ if [[ "${NET_ACTIVE}" != "yes" ]]; then
 fi
 sudo virsh net-autostart default >/dev/null
 
-# --- image de base --------------------------------------------------------
-sudo mkdir -p "$(dirname "${BASE_IMG}")"
+# --- la VM existe-t-elle déjà ? -------------------------------------------
+if virsh dominfo "${VM_NAME}" >/dev/null 2>&1; then
+    STATE="$(virsh domstate "${VM_NAME}")"
+    if [[ "${STATE}" == "running" ]]; then
+        log "la VM ${VM_NAME} est déjà démarrée"
+    else
+        # Cas fréquent : virsh shutdown, ou hôte redémarré sans autostart.
+        log "la VM ${VM_NAME} existe mais est éteinte — démarrage"
+        virsh start "${VM_NAME}" >/dev/null
+    fi
+else
+    for bin in virt-install virsh qemu-img curl sha256sum xorriso; do
+        command -v "${bin}" >/dev/null 2>&1 || die "${bin} introuvable"
+    done
 
-if [[ ! -f "${BASE_IMG}" ]]; then
-    log "téléchargement de l'image cloud Ubuntu (${UBUNTU_RELEASE}, ~600 Mo)"
-    sudo curl -fL --progress-bar -o "${BASE_IMG}.part" \
-        "${IMAGE_BASE_URL}/$(basename "${BASE_IMG}")"
-    sudo curl -fsSL -o "${BASE_IMG}.SHA256SUMS" "${IMAGE_BASE_URL}/SHA256SUMS"
+    # --- image de base ----------------------------------------------------
+    sudo mkdir -p "$(dirname "${BASE_IMG}")"
 
-    # Vérification d'intégrité : on ne démarre pas une image non vérifiée.
-    expected="$(awk -v f="$(basename "${BASE_IMG}")" \
-        '{ n = $2; sub(/^\*/, "", n); if (n == f) { print $1; exit } }' \
-        "${BASE_IMG}.SHA256SUMS")"
-    actual="$(sha256sum "${BASE_IMG}.part" | awk '{print $1}')"
-    [[ -n "${expected}" ]] || die "image absente du fichier SHA256SUMS"
-    [[ "${expected}" == "${actual}" ]] || die "checksum invalide (attendu ${expected}, obtenu ${actual})"
-    log "checksum OK"
+    if [[ ! -f "${BASE_IMG}" ]]; then
+        log "téléchargement de l'image cloud Ubuntu (${UBUNTU_RELEASE}, ~600 Mo)"
+        sudo curl -fL --progress-bar -o "${BASE_IMG}.part" \
+            "${IMAGE_BASE_URL}/$(basename "${BASE_IMG}")"
+        sudo curl -fsSL -o "${BASE_IMG}.SHA256SUMS" "${IMAGE_BASE_URL}/SHA256SUMS"
 
-    sudo mv "${BASE_IMG}.part" "${BASE_IMG}"
-    sudo rm -f "${BASE_IMG}.SHA256SUMS"
+        # Vérification d'intégrité : on ne démarre pas une image non vérifiée.
+        expected="$(awk -v f="$(basename "${BASE_IMG}")" \
+            '{ n = $2; sub(/^\*/, "", n); if (n == f) { print $1; exit } }' \
+            "${BASE_IMG}.SHA256SUMS")"
+        actual="$(sha256sum "${BASE_IMG}.part" | awk '{print $1}')"
+        [[ -n "${expected}" ]] || die "image absente du fichier SHA256SUMS"
+        [[ "${expected}" == "${actual}" ]] || die "checksum invalide (attendu ${expected}, obtenu ${actual})"
+        log "checksum OK"
+
+        sudo mv "${BASE_IMG}.part" "${BASE_IMG}"
+        sudo rm -f "${BASE_IMG}.SHA256SUMS"
+    fi
+
+    # Lecture seule : c'est le disque de base partagé, il ne doit jamais changer.
+    sudo chmod 0444 "${BASE_IMG}"
+
+    # --- disque de la VM --------------------------------------------------
+    # Overlay qcow2 : le disque de la VM ne stocke que ses différences avec
+    # l'image de base. Création instantanée, quelques centaines de Mo réels.
+    if [[ ! -f "${DISK}" ]]; then
+        log "création du disque (overlay qcow2, ${VM_DISK_GB} Go virtuels)"
+        sudo qemu-img create -q -f qcow2 -F qcow2 -b "${BASE_IMG}" "${DISK}" "${VM_DISK_GB}G"
+    fi
+    sudo chown "${QEMU_USER}:${QEMU_USER}" "${DISK}"
+    sudo chmod 0600 "${DISK}"
+
+    # --- seed cloud-init --------------------------------------------------
+    # On construit nous-mêmes l'ISO NoCloud au lieu de laisser virt-install le
+    # faire dans un répertoire temporaire : il le supprime après le premier
+    # boot, et le cdrom resté référencé empêche alors libvirt de redémarrer la
+    # VM. Ici le seed appartient à la VM et vit à côté de son disque.
+    log "génération du seed cloud-init"
+    mkdir -p "${SEED_DIR}"
+    SSH_PUBKEY="$(cat "${SSH_PUBKEY_FILE}")"
+    sed -e "s|__VM_NAME__|${VM_NAME}|g" \
+        -e "s|__SSH_PUBKEY__|${SSH_PUBKEY}|g" \
+        "${CLOUD_INIT_DIR}/user-data.yaml.tpl" > "${SEED_DIR}/user-data"
+    sed -e "s|__VM_NAME__|${VM_NAME}|g" \
+        "${CLOUD_INIT_DIR}/meta-data.yaml.tpl" > "${SEED_DIR}/meta-data"
+
+    # NoCloud impose un volume nommé « cidata » contenant user-data et meta-data.
+    ( cd "${SEED_DIR}" && sudo xorriso -as mkisofs -quiet \
+        -output "${SEED_ISO}" -volid cidata -joliet -rock \
+        user-data meta-data )
+    sudo chmod 0444 "${SEED_ISO}"
+
+    # --- création de la VM ------------------------------------------------
+    # --import        : pas d'installateur, l'image cloud démarre directement
+    # --noautoconsole : rend la main au lieu d'ouvrir une console
+    log "définition et démarrage de la VM ${VM_NAME}"
+    sudo virt-install \
+        --name "${VM_NAME}" \
+        --memory "${VM_MEMORY_MB}" \
+        --vcpus "${VM_VCPUS}" \
+        --cpu host-passthrough \
+        --os-variant "${OS_VARIANT}" \
+        --disk "path=${DISK},bus=virtio,cache=none,discard=unmap" \
+        --disk "path=${SEED_ISO},device=cdrom,readonly=on" \
+        --import \
+        --network "network=default,model=virtio" \
+        --graphics none \
+        --console pty,target_type=serial \
+        --noautoconsole \
+        --autostart
 fi
-
-# Lecture seule : c'est le disque de base partagé, il ne doit jamais changer.
-sudo chmod 0444 "${BASE_IMG}"
-
-# --- disque de la VM ------------------------------------------------------
-# Overlay qcow2 : le disque de la VM ne stocke que ses différences avec
-# l'image de base. Création instantanée, quelques centaines de Mo réels.
-if [[ ! -f "${DISK}" ]]; then
-    log "création du disque (overlay qcow2, ${VM_DISK_GB} Go virtuels)"
-    sudo qemu-img create -q -f qcow2 -F qcow2 -b "${BASE_IMG}" "${DISK}" "${VM_DISK_GB}G"
-fi
-sudo chown "${QEMU_USER}:${QEMU_USER}" "${DISK}"
-sudo chmod 0600 "${DISK}"
-
-# --- seed cloud-init ------------------------------------------------------
-# On construit nous-mêmes l'ISO NoCloud au lieu de laisser virt-install le
-# faire dans un répertoire temporaire : il le supprime après le premier boot,
-# et le cdrom resté référencé empêche alors libvirt de redémarrer la VM.
-# Ici le seed appartient à la VM et vit à côté de son disque.
-log "génération du seed cloud-init"
-mkdir -p "${SEED_DIR}"
-SSH_PUBKEY="$(cat "${SSH_PUBKEY_FILE}")"
-sed -e "s|__VM_NAME__|${VM_NAME}|g" \
-    -e "s|__SSH_PUBKEY__|${SSH_PUBKEY}|g" \
-    "${CLOUD_INIT_DIR}/user-data.yaml.tpl" > "${SEED_DIR}/user-data"
-sed -e "s|__VM_NAME__|${VM_NAME}|g" \
-    "${CLOUD_INIT_DIR}/meta-data.yaml.tpl" > "${SEED_DIR}/meta-data"
-
-# NoCloud impose un volume nommé « cidata » contenant user-data et meta-data.
-( cd "${SEED_DIR}" && sudo xorriso -as mkisofs -quiet \
-    -output "${SEED_ISO}" -volid cidata -joliet -rock \
-    user-data meta-data )
-sudo chmod 0444 "${SEED_ISO}"
-
-# --- création de la VM ----------------------------------------------------
-# --import        : pas d'installateur, l'image cloud démarre directement
-# --noautoconsole : rend la main au lieu d'ouvrir une console
-log "définition et démarrage de la VM ${VM_NAME}"
-sudo virt-install \
-    --name "${VM_NAME}" \
-    --memory "${VM_MEMORY_MB}" \
-    --vcpus "${VM_VCPUS}" \
-    --cpu host-passthrough \
-    --os-variant "${OS_VARIANT}" \
-    --disk "path=${DISK},bus=virtio,cache=none,discard=unmap" \
-    --disk "path=${SEED_ISO},device=cdrom,readonly=on" \
-    --import \
-    --network "network=default,model=virtio" \
-    --graphics none \
-    --console pty,target_type=serial \
-    --noautoconsole \
-    --autostart
 
 # --- attente de disponibilité --------------------------------------------
 # Un known_hosts dédié au lab évite de polluer ~/.ssh/known_hosts et évite le
 # classique « REMOTE HOST IDENTIFICATION HAS CHANGED » quand une recréation
 # réutilise la même IP DHCP.
-KNOWN_HOSTS="${BUILD_DIR}/known_hosts"
-
 log "attente de l'adresse IP (DHCP du réseau NAT)"
 IP=""
 for _ in $(seq 1 60); do
@@ -164,7 +170,7 @@ for _ in $(seq 1 60); do
 done
 [[ -n "${IP}" ]] || die "aucune adresse IP obtenue pour ${VM_NAME}"
 
-log "attente de SSH puis de la fin de cloud-init (1 à 2 min)"
+log "attente de SSH"
 ready=""
 for _ in $(seq 1 60); do
     if ssh -i "${SSH_KEY_FILE}" -o UserKnownHostsFile="${KNOWN_HOSTS}" \
