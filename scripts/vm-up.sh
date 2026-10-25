@@ -11,6 +11,10 @@
 
 set -euo pipefail
 
+# virsh et virt-install se connectent par défaut au démon *session* pour un
+# utilisateur non root. Les VMs et le réseau NAT vivent sur le démon système.
+export LIBVIRT_DEFAULT_URI=qemu:///system
+
 VM_NAME="${VM_NAME:-gitops-lab-01}"
 VM_VCPUS="${VM_VCPUS:-2}"
 VM_MEMORY_MB="${VM_MEMORY_MB:-4096}"
@@ -58,7 +62,11 @@ fi
 log "vérification de libvirtd et du réseau NAT"
 systemctl is-active --quiet libvirtd || sudo systemctl enable --now libvirtd
 virsh net-info default >/dev/null 2>&1 || die "réseau libvirt « default » absent"
-if ! virsh net-info default | grep -q '^Active:[[:space:]]*yes'; then
+
+# On lit l'état dans une variable : `virsh ... | grep -q` fermerait le tube,
+# virsh recevrait un SIGPIPE et `set -o pipefail` ferait échouer le test à tort.
+NET_ACTIVE="$(virsh net-info default | awk '/^Active:/ {print $2}')"
+if [[ "${NET_ACTIVE}" != "yes" ]]; then
     log "démarrage du réseau NAT"
     sudo virsh net-start default
 fi
@@ -132,8 +140,8 @@ sudo virt-install \
 
 # --- attente de disponibilité --------------------------------------------
 # Un known_hosts dédié au lab évite de polluer ~/.ssh/known_hosts et évite le
-# classique « REMOTE HOST IDENTIFICATION HAS CHANGED » quand recreate réutilise
-# la même IP DHCP.
+# classique « REMOTE HOST IDENTIFICATION HAS CHANGED » quand une recréation
+# réutilise la même IP DHCP.
 KNOWN_HOSTS="${BUILD_DIR}/known_hosts"
 
 log "attente de l'adresse IP (DHCP du réseau NAT)"
@@ -163,6 +171,16 @@ ssh -i "${SSH_KEY_FILE}" -o UserKnownHostsFile="${KNOWN_HOSTS}" -o BatchMode=yes
     "ubuntu@${IP}" 'cloud-init status --wait >/dev/null' \
     || warn "cloud-init n'a pas signalé de succès complet (voir : cloud-init status --long)"
 
+# --- nettoyage du seed cloud-init ----------------------------------------
+# virt-install supprime l'ISO de seed une fois le premier boot terminé. S'il
+# reste référencé dans le XML, libvirt refuse de redémarrer la VM : au reboot,
+# il tente d'ouvrir un fichier disparu et laisse le domaine éteint.
+cdrom_target="$(virsh domblklist "${VM_NAME}" --details | awk '$2 == "cdrom" {print $3}')"
+if [[ -n "${cdrom_target}" ]]; then
+    virsh detach-disk "${VM_NAME}" "${cdrom_target}" --config >/dev/null
+    log "seed cloud-init détaché (la VM ne dépend plus d'un fichier temporaire)"
+fi
+
 log "VM prête"
-printf '\n  Nom     : %s\n  IP      : %s\n  Accès   : ssh ubuntu@%s\n  Ressources : %s vCPU / %s Mo / %s Go\n\n' \
+printf '\n  Nom        : %s\n  IP         : %s\n  Accès      : ssh ubuntu@%s\n  Ressources : %s vCPU / %s Mo / %s Go\n\n' \
     "${VM_NAME}" "${IP}" "${IP}" "${VM_VCPUS}" "${VM_MEMORY_MB}" "${VM_DISK_GB}"

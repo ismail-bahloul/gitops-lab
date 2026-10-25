@@ -5,6 +5,10 @@
 
 set -euo pipefail
 
+# virsh et virt-install se connectent par défaut au démon *session* pour un
+# utilisateur non root. Les VMs et le réseau NAT vivent sur le démon système.
+export LIBVIRT_DEFAULT_URI=qemu:///system
+
 VM_NAME="${VM_NAME:-gitops-lab-01}"
 POOL_DIR="${POOL_DIR:-/var/lib/libvirt/images/gitops-lab}"
 DISK="${POOL_DIR}/${VM_NAME}.qcow2"
