@@ -51,5 +51,9 @@ k3s-up: ## Installe K3s dans la VM et récupère le kubeconfig côté hôte
 status: ## Affiche l'état de la VM et du cluster
 	@virsh dominfo $(VM_NAME) 2>/dev/null | grep -E '^(Name|State)' \
 		|| echo "VM $(VM_NAME) absente"
-	@$(KUBECTL) get nodes 2>/dev/null \
-		|| echo "cluster non initialisé (make k3s-up)"
+	@if virsh domstate $(VM_NAME) 2>/dev/null | grep -q '^running'; then \
+		$(KUBECTL) get nodes 2>/dev/null \
+			|| echo "cluster non initialisé (make k3s-up)"; \
+	else \
+		echo "VM arrêtée (make up)"; \
+	fi
