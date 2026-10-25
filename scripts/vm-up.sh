@@ -30,6 +30,7 @@ IMAGE_BASE_URL="${IMAGE_BASE_URL:-https://cloud-images.ubuntu.com/${UBUNTU_RELEA
 POOL_DIR="${POOL_DIR:-/var/lib/libvirt/images/gitops-lab}"
 BASE_IMG="${POOL_DIR}/base/${UBUNTU_RELEASE}-server-cloudimg-amd64.img"
 DISK="${POOL_DIR}/${VM_NAME}.qcow2"
+SEED_ISO="${POOL_DIR}/${VM_NAME}-seed.iso"
 
 SSH_PUBKEY_FILE="${SSH_PUBKEY_FILE:-${HOME}/.ssh/id_ed25519.pub}"
 SSH_KEY_FILE="${SSH_KEY_FILE:-${SSH_PUBKEY_FILE%.pub}}"
@@ -37,6 +38,7 @@ SSH_KEY_FILE="${SSH_KEY_FILE:-${SSH_PUBKEY_FILE%.pub}}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CLOUD_INIT_DIR="${REPO_ROOT}/cloud-init"
 BUILD_DIR="${REPO_ROOT}/build"
+SEED_DIR="${BUILD_DIR}/seed"
 
 QEMU_USER="${QEMU_USER:-qemu}"
 
@@ -45,7 +47,7 @@ warn() { printf '\033[1;33m==>\033[0m %s\n' "$*"; }
 die()  { printf '\033[1;31merreur:\033[0m %s\n' "$*" >&2; exit 1; }
 
 # --- prérequis -------------------------------------------------------------
-for bin in virt-install virsh qemu-img curl sha256sum; do
+for bin in virt-install virsh qemu-img curl sha256sum xorriso; do
     command -v "${bin}" >/dev/null 2>&1 || die "${bin} introuvable"
 done
 [[ -r "${SSH_PUBKEY_FILE}" ]] || die "clé publique SSH introuvable : ${SSH_PUBKEY_FILE}"
@@ -107,20 +109,28 @@ fi
 sudo chown "${QEMU_USER}:${QEMU_USER}" "${DISK}"
 sudo chmod 0600 "${DISK}"
 
-# --- cloud-init -----------------------------------------------------------
-# Généré depuis un template : aucune clé SSH personnelle n'est commitée.
-log "génération de la configuration cloud-init"
-mkdir -p "${BUILD_DIR}"
+# --- seed cloud-init ------------------------------------------------------
+# On construit nous-mêmes l'ISO NoCloud au lieu de laisser virt-install le
+# faire dans un répertoire temporaire : il le supprime après le premier boot,
+# et le cdrom resté référencé empêche alors libvirt de redémarrer la VM.
+# Ici le seed appartient à la VM et vit à côté de son disque.
+log "génération du seed cloud-init"
+mkdir -p "${SEED_DIR}"
 SSH_PUBKEY="$(cat "${SSH_PUBKEY_FILE}")"
 sed -e "s|__VM_NAME__|${VM_NAME}|g" \
     -e "s|__SSH_PUBKEY__|${SSH_PUBKEY}|g" \
-    "${CLOUD_INIT_DIR}/user-data.yaml.tpl" > "${BUILD_DIR}/user-data.yaml"
+    "${CLOUD_INIT_DIR}/user-data.yaml.tpl" > "${SEED_DIR}/user-data"
 sed -e "s|__VM_NAME__|${VM_NAME}|g" \
-    "${CLOUD_INIT_DIR}/meta-data.yaml.tpl" > "${BUILD_DIR}/meta-data.yaml"
+    "${CLOUD_INIT_DIR}/meta-data.yaml.tpl" > "${SEED_DIR}/meta-data"
+
+# NoCloud impose un volume nommé « cidata » contenant user-data et meta-data.
+( cd "${SEED_DIR}" && sudo xorriso -as mkisofs -quiet \
+    -output "${SEED_ISO}" -volid cidata -joliet -rock \
+    user-data meta-data )
+sudo chmod 0444 "${SEED_ISO}"
 
 # --- création de la VM ----------------------------------------------------
 # --import        : pas d'installateur, l'image cloud démarre directement
-# --cloud-init    : injecte un ISO NoCloud (utilisateur, clé SSH, sysctl)
 # --noautoconsole : rend la main au lieu d'ouvrir une console
 log "définition et démarrage de la VM ${VM_NAME}"
 sudo virt-install \
@@ -130,9 +140,9 @@ sudo virt-install \
     --cpu host-passthrough \
     --os-variant "${OS_VARIANT}" \
     --disk "path=${DISK},bus=virtio,cache=none,discard=unmap" \
+    --disk "path=${SEED_ISO},device=cdrom,readonly=on" \
     --import \
     --network "network=default,model=virtio" \
-    --cloud-init "user-data=${BUILD_DIR}/user-data.yaml,meta-data=${BUILD_DIR}/meta-data.yaml" \
     --graphics none \
     --console pty,target_type=serial \
     --noautoconsole \
@@ -170,16 +180,6 @@ done
 ssh -i "${SSH_KEY_FILE}" -o UserKnownHostsFile="${KNOWN_HOSTS}" -o BatchMode=yes \
     "ubuntu@${IP}" 'cloud-init status --wait >/dev/null' \
     || warn "cloud-init n'a pas signalé de succès complet (voir : cloud-init status --long)"
-
-# --- nettoyage du seed cloud-init ----------------------------------------
-# virt-install supprime l'ISO de seed une fois le premier boot terminé. S'il
-# reste référencé dans le XML, libvirt refuse de redémarrer la VM : au reboot,
-# il tente d'ouvrir un fichier disparu et laisse le domaine éteint.
-cdrom_target="$(virsh domblklist "${VM_NAME}" --details | awk '$2 == "cdrom" {print $3}')"
-if [[ -n "${cdrom_target}" ]]; then
-    virsh detach-disk "${VM_NAME}" "${cdrom_target}" --config >/dev/null
-    log "seed cloud-init détaché (la VM ne dépend plus d'un fichier temporaire)"
-fi
 
 log "VM prête"
 printf '\n  Nom        : %s\n  IP         : %s\n  Accès      : ssh ubuntu@%s\n  Ressources : %s vCPU / %s Mo / %s Go\n\n' \

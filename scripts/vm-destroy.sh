@@ -1,17 +1,16 @@
 #!/usr/bin/env bash
 #
-# Détruit la VM et son disque. L'image de base reste en cache : recréer une
-# VM ne coûte alors que quelques secondes (overlay qcow2).
+# Détruit la VM, son disque et son seed cloud-init. L'image de base reste en
+# cache : recréer une VM ne coûte alors que quelques secondes (overlay qcow2).
 
 set -euo pipefail
 
-# virsh et virt-install se connectent par défaut au démon *session* pour un
-# utilisateur non root. Les VMs et le réseau NAT vivent sur le démon système.
 export LIBVIRT_DEFAULT_URI=qemu:///system
 
 VM_NAME="${VM_NAME:-gitops-lab-01}"
 POOL_DIR="${POOL_DIR:-/var/lib/libvirt/images/gitops-lab}"
 DISK="${POOL_DIR}/${VM_NAME}.qcow2"
+SEED_ISO="${POOL_DIR}/${VM_NAME}-seed.iso"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
@@ -23,9 +22,9 @@ else
     echo "VM ${VM_NAME} absente"
 fi
 
-sudo rm -f "${DISK}"
+sudo rm -f "${DISK}" "${SEED_ISO}"
 
 # Le kubeconfig et les artefacts générés n'ont plus de sens sans la VM.
 rm -rf "${REPO_ROOT}/.kube" "${REPO_ROOT}/build"
 
-echo "disque et artefacts locaux supprimés (image de base conservée)"
+echo "disque, seed cloud-init et artefacts locaux supprimés (image de base conservée)"
