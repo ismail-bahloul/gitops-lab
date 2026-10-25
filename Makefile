@@ -14,16 +14,17 @@ export LIBVIRT_DEFAULT_URI
 
 VM_NAME ?= gitops-lab-01
 SSH_KEY ?= $(HOME)/.ssh/id_ed25519
+KUBECTL ?= $(HOME)/.local/bin/kubectl
 KUBECONFIG_FILE := $(CURDIR)/.kube/config
 export KUBECONFIG := $(KUBECONFIG_FILE)
 
-.PHONY: help up destroy vm-up vm-destroy vm-stop vm-ip ssh status
+.PHONY: help up destroy vm-up vm-stop vm-destroy vm-ip ssh k3s-up status
 
 help: ## Affiche cette aide
 	@grep -E '^[a-zA-Z0-9_-]+:.*?## ' $(MAKEFILE_LIST) \
 		| awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}'
 
-up: vm-up ## Crée ou démarre la VM (convergent)
+up: vm-up k3s-up ## Crée la VM et y installe K3s (convergent)
 
 destroy: vm-destroy ## Détruit tout : VM, disque, seed (garde l'image de base)
 
@@ -44,6 +45,11 @@ ssh: ## Ouvre un shell sur la VM
 	@ssh -i $(SSH_KEY) -o UserKnownHostsFile=build/known_hosts \
 		-o StrictHostKeyChecking=accept-new "ubuntu@$$(./scripts/vm-ip.sh)"
 
-status: ## Affiche l'état de la VM
+k3s-up: ## Installe K3s dans la VM et récupère le kubeconfig côté hôte
+	./scripts/k3s-install.sh
+
+status: ## Affiche l'état de la VM et du cluster
 	@virsh dominfo $(VM_NAME) 2>/dev/null | grep -E '^(Name|State)' \
 		|| echo "VM $(VM_NAME) absente"
+	@$(KUBECTL) get nodes 2>/dev/null \
+		|| echo "cluster non initialisé (make k3s-up)"

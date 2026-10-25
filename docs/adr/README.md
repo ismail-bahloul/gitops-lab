@@ -13,7 +13,7 @@ git log -- docs/adr/0005-environnement-vm-vs-hote.md
 
 | # | Décision | Statut |
 |---|---|---|
-| 0001 | K3s plutôt que kubeadm / Kubernetes complet | à venir (Session 1) |
+| [0001](0001-k3s-vs-kubeadm.md) | K3s plutôt que kubeadm / Kubernetes complet | accepté |
 | 0002 | Argo CD plutôt que Flux | à venir (Session 1) |
 | 0003 | Terraform + libvirt plutôt qu'un cloud | à venir (Session 2) |
 | 0004 | Gestion des secrets | à venir (au premier secret réel) |
